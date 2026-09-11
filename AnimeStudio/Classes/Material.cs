@@ -136,6 +136,10 @@ namespace AnimeStudio
         private static bool HasEnabledPassMask(SerializedType type) => type.Match("6BDB1CD05E80C82ABB24930CD37AEE88");
 
         public PPtr<Shader> m_Shader;
+        public string[] m_ValidKeywords;
+        public uint m_LightmapFlags;
+        public int m_CustomRenderQueue;
+        public string[] m_DisabledShaderPasses;
         public UnityPropertySheet m_SavedProperties;
 
         public Material(ObjectReader reader) : base(reader)
@@ -154,7 +158,7 @@ namespace AnimeStudio
 
             if (version[0] > 2021 || (version[0] == 2021 && version[1] >= 3)) //2021.3 and up
             {
-                var m_ValidKeywords = reader.ReadStringArray();
+                m_ValidKeywords = reader.ReadStringArray();
                 var m_InvalidKeywords = reader.ReadStringArray();
             }
             else if (version[0] >= 5) //5.0 ~ 2021.2
@@ -164,7 +168,7 @@ namespace AnimeStudio
 
             if (version[0] >= 5) //5.0 and up
             {
-                var m_LightmapFlags = reader.ReadUInt32();
+                m_LightmapFlags = reader.ReadUInt32();
             }
 
             if (version[0] > 5 || (version[0] == 5 && version[1] >= 6)) //5.6 and up
@@ -177,7 +181,7 @@ namespace AnimeStudio
 
             if (version[0] > 4 || (version[0] == 4 && version[1] >= 3)) //4.3 and up
             {
-                var m_CustomRenderQueue = reader.ReadInt32();
+                m_CustomRenderQueue = reader.ReadInt32();
             }
 
             if (reader.Game.Type.IsRewindingCadence())
@@ -207,7 +211,7 @@ namespace AnimeStudio
 
             if (version[0] > 5 || (version[0] == 5 && version[1] >= 6)) //5.6 and up
             {
-                var disabledShaderPasses = reader.ReadStringArray();
+                m_DisabledShaderPasses = reader.ReadStringArray();
             }
 
             if (reader.Game.Type.IsZZZ() && HasEnabledPassMask(reader.serializedType))

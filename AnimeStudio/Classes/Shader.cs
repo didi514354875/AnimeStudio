@@ -1213,6 +1213,47 @@ namespace AnimeStudio
         }
     }
 
+    /// <summary>
+    /// Shader LOD streaming container — the layout used by the current live Endfield build
+    /// (Unity's <c>m_EnableShaderLODStreaming</c> path).
+    ///
+    /// Unlike <see cref="SubShaderBinaryData"/> (which the Shader reached through
+    /// <c>PPtr</c>s), the compiled program chunks live *inside* the Shader and are grouped
+    /// per ShaderLOD:
+    ///
+    /// <code>
+    /// m_CompressedBlob            all chunks of this LOD, LZ4 compressed, back to back
+    /// m_Offsets[0][j]             start of chunk j inside m_CompressedBlob
+    /// m_CompressedLengths[0][j]   compressed length of chunk j
+    /// m_DecompressedLengths[0][j] decompressed length of chunk j
+    /// </code>
+    ///
+    /// Chunk 0 is the program index table (decoded by <see cref="ShaderProgram"/>),
+    /// chunks 1..n are the per-variant program segments.  The outer array index is 0 in
+    /// every build seen so far; it is kept because the field really is a
+    /// <c>vector&lt;vector&lt;unsigned int&gt;&gt;</c>.
+    /// </summary>
+    public class SubShaderBlob
+    {
+        public int m_ShaderLOD;
+        public byte[] m_CompressedBlob;
+        public uint[][] m_Offsets;
+        public uint[][] m_CompressedLengths;
+        public uint[][] m_DecompressedLengths;
+
+        public SubShaderBlob(ObjectReader reader)
+        {
+            m_ShaderLOD = reader.ReadInt32();
+            m_CompressedBlob = reader.ReadUInt8Array();
+            // the blob length is arbitrary (an empty LOD can be 5 bytes), so the following
+            // arrays only start on the next 4-byte boundary
+            reader.AlignStream();
+            m_Offsets = reader.ReadUInt32ArrayArray();
+            m_CompressedLengths = reader.ReadUInt32ArrayArray();
+            m_DecompressedLengths = reader.ReadUInt32ArrayArray();
+        }
+    }
+
     public class Shader : NamedObject
     {
         public byte[] m_Script;
@@ -1224,6 +1265,9 @@ namespace AnimeStudio
         public bool m_UseExternalBlobs;
         public int[] m_SubShaderBinaryDataLODs;
         public List<PPtr<SubShaderBinaryData>> m_SubShaderBinaryData;
+        // live Endfield (ArknightsEndfieldNew): streaming blobs embedded in the Shader
+        public bool m_EnableShaderLODStreaming;
+        public List<SubShaderBlob> subShaderBlobs;
         public ShaderCompilerPlatform[] platforms;
         public uint[][] offsets;
         public uint[][] compressedLengths;
@@ -1247,7 +1291,22 @@ namespace AnimeStudio
                     Logger.Error($"Cannot parse shader, no more bytes left for asset {reader.assetsFile.fileName} of {reader.assetsFile.originalPath} at path {reader.m_PathID}.");
                     return;
                 }
-                if (reader.Game.Type.IsArknightsEndfieldCB3() || reader.Game.Type.IsArknightsEndfield())
+                if (reader.Game.Type.IsArknightsEndfieldNew())
+                {
+                    // Live Endfield: the shader carries its program chunks itself, one
+                    // SubShaderBlob per ShaderLOD.  Must be tested *before* the CB3/Endfield
+                    // branch, because IsArknightsEndfield() also covers this build.
+                    m_EnableShaderLODStreaming = reader.ReadBoolean();
+                    reader.AlignStream();
+
+                    int numSubShaderBlobs = reader.ReadInt32();
+                    subShaderBlobs = new List<SubShaderBlob>();
+                    for (int i = 0; i < numSubShaderBlobs; i++)
+                    {
+                        subShaderBlobs.Add(new SubShaderBlob(reader));
+                    }
+                }
+                else if (reader.Game.Type.IsArknightsEndfieldCB3() || reader.Game.Type.IsArknightsEndfield())
                 {
                     m_UseExternalBlobs = reader.ReadBoolean();
                     reader.AlignStream();

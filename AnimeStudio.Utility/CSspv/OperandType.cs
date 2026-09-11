@@ -151,6 +151,11 @@ namespace SpirV
 		public override bool ReadValue(IReadOnlyList<uint> words, int index, out object value, out int wordsUsed)
 		{
 			int wordsUsedForParameters = 0;
+			// Parameters follow the enum word, which lives at `index`.  The previous code
+			// read them from the absolute position 1, so every enum parameter (OpDecorate's
+			// Location/Binding/Offset, OpExecutionMode's operands, ...) was taken from the
+			// instruction's FIRST operand - e.g. OpDecorate %16 DescriptorSet 0 disassembled
+			// as OpDecorate %16 DescriptorSet 16.
 			if (typeof(T).GetTypeInfo().GetCustomAttributes<FlagsAttribute>().Any())
 			{
 				Dictionary<uint, IReadOnlyList<object>> result = new Dictionary<uint, IReadOnlyList<object>>();
@@ -170,7 +175,7 @@ namespace SpirV
 							object[] resultItems = new object[p.OperandTypes.Count];
 							for (int j = 0; j < p.OperandTypes.Count; ++j)
 							{
-								p.OperandTypes[j].ReadValue(words, 1 + wordsUsedForParameters, out object pValue, out int pWordsUsed);
+								p.OperandTypes[j].ReadValue(words, index + 1 + wordsUsedForParameters, out object pValue, out int pWordsUsed);
 								wordsUsedForParameters += pWordsUsed;
 								resultItems[j] = pValue;
 							}
@@ -193,7 +198,7 @@ namespace SpirV
 					resultItems = new object[p.OperandTypes.Count];
 					for (int j = 0; j < p.OperandTypes.Count; ++j)
 					{
-						p.OperandTypes[j].ReadValue(words, 1 + wordsUsedForParameters, out object pValue, out int pWordsUsed);
+						p.OperandTypes[j].ReadValue(words, index + 1 + wordsUsedForParameters, out object pValue, out int pWordsUsed);
 						wordsUsedForParameters += pWordsUsed;
 						resultItems[j] = pValue;
 					}

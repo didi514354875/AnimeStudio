@@ -15,6 +15,16 @@ namespace AnimeStudio
 {
     public static class ShaderConverter
     {
+        /// <summary>
+        /// <c>ANIMESTUDIO_SHADER_VARIANTS=first</c> writes only the first keyword variant of
+        /// each stage (and, for the classic layout, only the first blob index).  A keyword
+        /// heavy shader can hold thousands of variants and the exported .shader grows with
+        /// every one of them, so this trades completeness for a manageable file size.
+        /// </summary>
+        private static readonly bool FirstVariantOnly = string.Equals(
+            Environment.GetEnvironmentVariable("ANIMESTUDIO_SHADER_VARIANTS"),
+            "first", StringComparison.OrdinalIgnoreCase);
+
         public static string Convert(this Shader shader)
         {
             if (shader.platformInfos != null)
@@ -37,6 +47,14 @@ namespace AnimeStudio
                 }
             }
 
+            // Live Endfield (m_EnableShaderLODStreaming): the compiled programs are not in
+            // compressedBlob at all, they sit in subShaderBlobs, one blob per ShaderLOD.
+            // Must be tested before compressedBlob, which parses as an empty array here.
+            if (shader.subShaderBlobs != null && shader.subShaderBlobs.Count > 0)
+            {
+                return header + ConvertSerializedShader(shader);
+            }
+
             if (shader.compressedBlob != null) //5.5 and up
             {
                 return header + ConvertSerializedShader(shader);
@@ -47,6 +65,20 @@ namespace AnimeStudio
 
         private static string ConvertSerializedShader(Shader shader)
         {
+            if (shader.subShaderBlobs != null && shader.subShaderBlobs.Count > 0)
+            {
+                // One ShaderProgram[] (indexed by platform) per ShaderLOD.  The subshaders of
+                // m_ParsedForm carry matching m_LOD values, and every LOD has its own program
+                // index table, so they must stay separate -- the same Pass has different
+                // m_BlobIndex ranges in different LODs.
+                var programsByLod = new Dictionary<int, ShaderProgram[]>();
+                foreach (var blob in shader.subShaderBlobs)
+                {
+                    programsByLod[blob.m_ShaderLOD] = DecompressSubShaderBlob(shader, blob);
+                }
+                return ConvertSerializedShader(shader.m_ParsedForm, shader.platforms, new ShaderProgramSet(programsByLod));
+            }
+
             var length = shader.platforms.Length;
             var shaderPrograms = new ShaderProgram[length];
             for (var i = 0; i < length; i++)
@@ -56,19 +88,7 @@ namespace AnimeStudio
                     var offset = shader.offsets[i][j];
                     var compressedLength = shader.compressedLengths[i][j];
                     var decompressedLength = shader.decompressedLengths[i][j];
-                    var decompressedBytes = new byte[decompressedLength];
-                    if (shader.assetsFile.game.Type.IsGISubGroup())
-                    {
-                        Buffer.BlockCopy(shader.compressedBlob, (int)offset, decompressedBytes, 0, (int)decompressedLength);
-                    }
-                    else
-                    {
-                        var numWrite = LZ4.Instance.Decompress(shader.compressedBlob.AsSpan().Slice((int)offset, (int)compressedLength), decompressedBytes.AsSpan().Slice(0, (int)decompressedLength));
-                        if (numWrite != decompressedLength)
-                        {
-                            throw new IOException($"Lz4 decompression error, write {numWrite} bytes but expected {decompressedLength} bytes");
-                        }
-                    }
+                    var decompressedBytes = DecompressChunk(shader, shader.compressedBlob, (int)offset, (int)compressedLength, (int)decompressedLength);
                     using (var blobReader = new EndianBinaryReader(new MemoryStream(decompressedBytes), EndianType.LittleEndian))
                     {
                         if (j == 0)
@@ -80,19 +100,101 @@ namespace AnimeStudio
                 }
             }
 
-            return ConvertSerializedShader(shader.m_ParsedForm, shader.platforms, shaderPrograms);
+            return ConvertSerializedShader(shader.m_ParsedForm, shader.platforms, new ShaderProgramSet(shaderPrograms));
         }
 
-        private static string ConvertSerializedShader(SerializedShader m_ParsedForm, ShaderCompilerPlatform[] platforms, ShaderProgram[] shaderPrograms)
+        /// <summary>
+        /// Expand one <see cref="SubShaderBlob"/> into a <see cref="ShaderProgram"/> per
+        /// platform.  Chunk 0 holds the program index table, chunks 1..n the program
+        /// segments; <see cref="ShaderProgram.Read"/> already routes each entry to the
+        /// chunk named by its <c>Segment</c> field, so feeding it the decompressed chunk
+        /// (segment) by segment is enough.
+        /// </summary>
+        private static ShaderProgram[] DecompressSubShaderBlob(Shader shader, SubShaderBlob blob)
+        {
+            var programs = new ShaderProgram[shader.platforms.Length];
+            if (blob.m_Offsets == null)
+            {
+                return programs;
+            }
+
+            for (var i = 0; i < blob.m_Offsets.Length && i < programs.Length; i++)
+            {
+                var offsets = blob.m_Offsets[i];
+                var compressedLengths = blob.m_CompressedLengths[i];
+                var decompressedLengths = blob.m_DecompressedLengths[i];
+                for (var j = 0; j < offsets.Length; j++)
+                {
+                    var decompressedBytes = DecompressChunk(
+                        shader,
+                        blob.m_CompressedBlob,
+                        (int)offsets[j],
+                        (int)compressedLengths[j],
+                        (int)decompressedLengths[j]);
+                    using (var blobReader = new EndianBinaryReader(new MemoryStream(decompressedBytes), EndianType.LittleEndian))
+                    {
+                        if (j == 0)
+                        {
+                            programs[i] = new ShaderProgram(blobReader, shader);
+                        }
+                        programs[i].Read(blobReader, j);
+                    }
+                }
+            }
+
+            return programs;
+        }
+
+        private static byte[] DecompressChunk(Shader shader, byte[] blob, int offset, int compressedLength, int decompressedLength)
+        {
+            var decompressedBytes = new byte[decompressedLength];
+            if (decompressedLength == 0)
+            {
+                return decompressedBytes;
+            }
+
+            if (shader.assetsFile.game.Type.IsGISubGroup() || compressedLength == decompressedLength)
+            {
+                // Stored uncompressed (Unity skips LZ4 when the two lengths match).
+                Buffer.BlockCopy(blob, offset, decompressedBytes, 0, decompressedLength);
+                return decompressedBytes;
+            }
+
+            int numWrite;
+            try
+            {
+                numWrite = LZ4.Instance.Decompress(blob.AsSpan().Slice(offset, compressedLength), decompressedBytes.AsSpan().Slice(0, decompressedLength));
+            }
+            catch (Exception)
+            {
+                // Defensive: fall back to a raw copy rather than losing the whole export.
+                Buffer.BlockCopy(blob, offset, decompressedBytes, 0, decompressedLength);
+                return decompressedBytes;
+            }
+
+            if (numWrite != decompressedLength)
+            {
+                throw new IOException($"Lz4 decompression error, write {numWrite} bytes but expected {decompressedLength} bytes");
+            }
+
+            return decompressedBytes;
+        }
+
+        private static string ConvertSerializedShader(SerializedShader m_ParsedForm, ShaderCompilerPlatform[] platforms, ShaderProgramSet shaderPrograms)
         {
             var sb = new StringBuilder();
             sb.Append($"Shader \"{m_ParsedForm.m_Name}\" {{\n");
 
             sb.Append(ConvertSerializedProperties(m_ParsedForm.m_PropInfo));
 
+            // Shader wide union of every pass' bindings: some passes ship minimal
+            // per-pass parameters that do not describe all the descriptor sets their
+            // compiled programs reference, so renaming falls back to the union.
+            var shaderWide = BuildShaderWideContext(m_ParsedForm);
+
             foreach (var m_SubShader in m_ParsedForm.m_SubShaders)
             {
-                sb.Append(ConvertSerializedSubShader(m_SubShader, platforms, shaderPrograms));
+                sb.Append(ConvertSerializedSubShader(m_SubShader, platforms, shaderPrograms, shaderWide));
             }
 
             if (!string.IsNullOrEmpty(m_ParsedForm.m_FallbackName))
@@ -109,8 +211,40 @@ namespace AnimeStudio
             return sb.ToString();
         }
 
-        private static string ConvertSerializedSubShader(SerializedSubShader m_SubShader, ShaderCompilerPlatform[] platforms, ShaderProgram[] shaderPrograms)
+        /// <summary>
+        /// Union of the binding contexts of every (pass, stage) pair in the shader.
+        /// Conflicting names behind one (set, binding) key are dropped.
+        /// </summary>
+        private static ShaderBindingContext BuildShaderWideContext(SerializedShader m_ParsedForm)
         {
+            var union = new ShaderBindingContext();
+            foreach (var subShader in m_ParsedForm.m_SubShaders)
+            {
+                foreach (var pass in subShader.m_Passes)
+                {
+                    foreach (var program in new[] { pass.progVertex, pass.progFragment, pass.progGeometry, pass.progHull, pass.progDomain, pass.progRayTracing })
+                    {
+                        if (program?.m_CommonParameters == null)
+                        {
+                            continue;
+                        }
+                        var context = ShaderBindingContext.Build(pass.m_NameIndices, program.m_CommonParameters);
+                        if (context != null)
+                        {
+                            ShaderBindingContext.Merge(context, union);
+                        }
+                    }
+                }
+            }
+            return union;
+        }
+
+        private static string ConvertSerializedSubShader(SerializedSubShader m_SubShader, ShaderCompilerPlatform[] platforms, ShaderProgramSet shaderProgramSet, ShaderBindingContext shaderWide)
+        {
+            // A subshader is tied to one ShaderLOD; with LOD streaming every LOD has its own
+            // program index table, so resolve the matching set here and pass the plain array down.
+            var shaderPrograms = shaderProgramSet.Resolve(m_SubShader.m_LOD);
+
             var sb = new StringBuilder();
             sb.Append("SubShader {\n");
             if (m_SubShader.m_LOD != 0)
@@ -122,13 +256,13 @@ namespace AnimeStudio
 
             foreach (var m_Passe in m_SubShader.m_Passes)
             {
-                sb.Append(ConvertSerializedPass(m_Passe, platforms, shaderPrograms));
+                sb.Append(ConvertSerializedPass(m_Passe, platforms, shaderPrograms, shaderWide));
             }
             sb.Append("}\n");
             return sb.ToString();
         }
 
-        private static string ConvertSerializedPass(SerializedPass m_Passe, ShaderCompilerPlatform[] platforms, ShaderProgram[] shaderPrograms)
+        private static string ConvertSerializedPass(SerializedPass m_Passe, ShaderCompilerPlatform[] platforms, ShaderProgram[] shaderPrograms, ShaderBindingContext shaderWide)
         {
             var sb = new StringBuilder();
             switch (m_Passe.m_Type)
@@ -162,57 +296,127 @@ namespace AnimeStudio
                 {
                     sb.Append(ConvertSerializedShaderState(m_Passe.m_State));
 
-                    if (m_Passe.progVertex.m_SubPrograms.Count > 0)
-                    {
-                        sb.Append("Program \"vp\" {\n");
-                        sb.Append(ConvertSerializedSubPrograms(m_Passe.progVertex.m_SubPrograms, platforms, shaderPrograms));
-                        sb.Append("}\n");
-                    }
-
-                    if (m_Passe.progFragment.m_SubPrograms.Count > 0)
-                    {
-                        sb.Append("Program \"fp\" {\n");
-                        sb.Append(ConvertSerializedSubPrograms(m_Passe.progFragment.m_SubPrograms, platforms, shaderPrograms));
-                        sb.Append("}\n");
-                    }
-
-                    if (m_Passe.progGeometry.m_SubPrograms.Count > 0)
-                    {
-                        sb.Append("Program \"gp\" {\n");
-                        sb.Append(ConvertSerializedSubPrograms(m_Passe.progGeometry.m_SubPrograms, platforms, shaderPrograms));
-                        sb.Append("}\n");
-                    }
-
-                    if (m_Passe.progHull.m_SubPrograms.Count > 0)
-                    {
-                        sb.Append("Program \"hp\" {\n");
-                        sb.Append(ConvertSerializedSubPrograms(m_Passe.progHull.m_SubPrograms, platforms, shaderPrograms));
-                        sb.Append("}\n");
-                    }
-
-                    if (m_Passe.progDomain.m_SubPrograms.Count > 0)
-                    {
-                        sb.Append("Program \"dp\" {\n");
-                        sb.Append(ConvertSerializedSubPrograms(m_Passe.progDomain.m_SubPrograms, platforms, shaderPrograms));
-                        sb.Append("}\n");
-                    }
-
-                    if (m_Passe.progRayTracing?.m_SubPrograms.Count > 0)
-                    {
-                        sb.Append("Program \"rtp\" {\n");
-                        sb.Append(ConvertSerializedSubPrograms(m_Passe.progRayTracing.m_SubPrograms, platforms, shaderPrograms));
-                        sb.Append("}\n");
-                    }
+                    AppendProgram(sb, "vp", m_Passe.progVertex, platforms, shaderPrograms, m_Passe.m_NameIndices, shaderWide);
+                    AppendProgram(sb, "fp", m_Passe.progFragment, platforms, shaderPrograms, m_Passe.m_NameIndices, shaderWide);
+                    AppendProgram(sb, "gp", m_Passe.progGeometry, platforms, shaderPrograms, m_Passe.m_NameIndices, shaderWide);
+                    AppendProgram(sb, "hp", m_Passe.progHull, platforms, shaderPrograms, m_Passe.m_NameIndices, shaderWide);
+                    AppendProgram(sb, "dp", m_Passe.progDomain, platforms, shaderPrograms, m_Passe.m_NameIndices, shaderWide);
+                    AppendProgram(sb, "rtp", m_Passe.progRayTracing, platforms, shaderPrograms, m_Passe.m_NameIndices, shaderWide);
                 }
                 sb.Append("}\n");
             }
             return sb.ToString();
         }
 
-        private static string ConvertSerializedSubPrograms(List<SerializedSubProgram> m_SubPrograms, ShaderCompilerPlatform[] platforms, ShaderProgram[] shaderPrograms)
+        /// <summary>
+        /// Emit a <c>Program "xx" { ... }</c> block for a single stage, or nothing at all when
+        /// the stage carries no programs.  <paramref name="nameIndices"/> is the pass wide
+        /// name table the GLSL uniform renamer resolves bindings against.
+        /// </summary>
+        private static void AppendProgram(StringBuilder sb, string stageName, SerializedProgram program, ShaderCompilerPlatform[] platforms, ShaderProgram[] shaderPrograms, List<KeyValuePair<string, int>> nameIndices, ShaderBindingContext shaderWide)
+        {
+            var body = program == null ? null : ConvertSerializedProgram(program, platforms, shaderPrograms, nameIndices, shaderWide);
+            if (string.IsNullOrEmpty(body))
+            {
+                return;
+            }
+            sb.Append($"Program \"{stageName}\" {{\n");
+            sb.Append(body);
+            sb.Append("}\n");
+        }
+
+        /// <summary>
+        /// Serialized passes carry their variants in either of two places: <c>m_SubPrograms</c>
+        /// (editor data, the only one old AnimeStudio looked at) or <c>m_PlayerSubPrograms</c>
+        /// (what a 2021.3.10+ *player* build actually ships -- m_SubPrograms is empty there, which
+        /// is why shaders exported from such a build came out with no program blocks at all).
+        /// </summary>
+        private static string ConvertSerializedProgram(SerializedProgram program, ShaderCompilerPlatform[] platforms, ShaderProgram[] shaderPrograms, List<KeyValuePair<string, int>> nameIndices, ShaderBindingContext shaderWide)
+        {
+            if (program.m_SubPrograms != null && program.m_SubPrograms.Count > 0)
+            {
+                return ConvertSerializedSubPrograms(program.m_SubPrograms, platforms, shaderPrograms, nameIndices, shaderWide);
+            }
+            if (program.m_PlayerSubPrograms != null && program.m_PlayerSubPrograms.Count > 0)
+            {
+                return ConvertSerializedPlayerSubPrograms(program.m_PlayerSubPrograms, platforms, shaderPrograms, nameIndices, program.m_CommonParameters, shaderWide);
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Emit the variant list a player build ships.  The outer list is a group per graphics
+        /// tier/platform bucket and in the builds seen so far only one of them holds data, so
+        /// the first group that targets a platform this shader was built for wins.  Every entry
+        /// of that group is one variant, addressed by its <c>m_BlobIndex</c> in the program table
+        /// of the shader LOD owning the pass.
+        /// </summary>
+        private static string ConvertSerializedPlayerSubPrograms(List<List<SerializedPlayerSubProgram>> playerSubPrograms, ShaderCompilerPlatform[] platforms, ShaderProgram[] shaderPrograms, List<KeyValuePair<string, int>> nameIndices, SerializedProgramParameters commonParameters, ShaderBindingContext shaderWide)
+        {
+            var sb = new StringBuilder();
+            // All variants of one stage share the pass' common parameters, so one binding
+            // context covers every SubProgram emitted below.
+            var bindingContext = ShaderBindingContext.Build(nameIndices, commonParameters);
+            if (bindingContext != null)
+            {
+                bindingContext.Fallback = shaderWide;
+            }
+            foreach (var group in playerSubPrograms)
+            {
+                if (group == null || group.Count == 0)
+                {
+                    continue;
+                }
+
+                for (int i = 0; i < platforms.Length; i++)
+                {
+                    var platform = platforms[i];
+                    var platformPrograms = shaderPrograms[i]?.m_SubPrograms;
+
+                    foreach (var typeGroup in group.GroupBy(x => x.m_GpuProgramType))
+                    {
+                        if (!CheckGpuProgramUsable(platform, typeGroup.Key))
+                        {
+                            continue;
+                        }
+
+                        foreach (var subProgram in typeGroup)
+                        {
+                            sb.Append($"SubProgram \"{GetPlatformString(platform)} \" {{\n");
+                            if (platformPrograms == null || subProgram.m_BlobIndex >= platformPrograms.Length)
+                            {
+                                sb.Append($"// blob {subProgram.m_BlobIndex} not present in this LOD's program table\n");
+                            }
+                            else if (platformPrograms[subProgram.m_BlobIndex] == null)
+                            {
+                                sb.Append($"// blob {subProgram.m_BlobIndex} not decoded\n");
+                            }
+                            else
+                            {
+                                sb.Append(platformPrograms[subProgram.m_BlobIndex].Export(bindingContext));
+                            }
+                            sb.Append("\n}\n");
+                            if (FirstVariantOnly)
+                            {
+                                break;
+                            }
+                        }
+
+                        return sb.ToString();
+                    }
+                }
+            }
+            return sb.ToString();
+        }
+
+        private static string ConvertSerializedSubPrograms(List<SerializedSubProgram> m_SubPrograms, ShaderCompilerPlatform[] platforms, ShaderProgram[] shaderPrograms, List<KeyValuePair<string, int>> nameIndices, ShaderBindingContext shaderWide)
         {
             var sb = new StringBuilder();
             var groups = m_SubPrograms.GroupBy(x => x.m_BlobIndex);
+            if (FirstVariantOnly)
+            {
+                groups = groups.Take(1);
+            }
             foreach (var group in groups)
             {
                 var programs = group.GroupBy(x => x.m_GpuProgramType);
@@ -223,20 +427,37 @@ namespace AnimeStudio
                         var platform = platforms[i];
                         if (CheckGpuProgramUsable(platform, program.Key))
                         {
-                            var subPrograms = program.ToList();
-                            var isTier = subPrograms.Count > 1;
-                            foreach (var subProgram in subPrograms)
-                            {
-                                sb.Append($"SubProgram \"{GetPlatformString(platform)} ");
-                                if (isTier)
+                                var subPrograms = program.ToList();
+                                var isTier = subPrograms.Count > 1;
+                                var platformPrograms = shaderPrograms[i]?.m_SubPrograms;
+                                foreach (var subProgram in subPrograms)
                                 {
-                                    sb.Append($"hw_tier{subProgram.m_ShaderHardwareTier:00} ");
+                                    sb.Append($"SubProgram \"{GetPlatformString(platform)} ");
+                                    if (isTier)
+                                    {
+                                        sb.Append($"hw_tier{subProgram.m_ShaderHardwareTier:00} ");
+                                    }
+                                    sb.Append("\" {\n");
+                                    if (platformPrograms == null || subProgram.m_BlobIndex >= platformPrograms.Length)
+                                    {
+                                        sb.Append($"// blob {subProgram.m_BlobIndex} not present in this LOD's program table\n");
+                                    }
+                                    else if (platformPrograms[subProgram.m_BlobIndex] == null)
+                                    {
+                                        sb.Append($"// blob {subProgram.m_BlobIndex} not decoded\n");
+                                    }
+                                    else
+                                    {
+                                        var subContext = ShaderBindingContext.Build(nameIndices, subProgram.m_Parameters);
+                                        if (subContext != null)
+                                        {
+                                            subContext.Fallback = shaderWide;
+                                        }
+                                        sb.Append(platformPrograms[subProgram.m_BlobIndex].Export(subContext));
+                                    }
+                                    sb.Append("\n}\n");
                                 }
-                                sb.Append("\" {\n");
-                                sb.Append(shaderPrograms[i].m_SubPrograms[subProgram.m_BlobIndex].Export());
-                                sb.Append("\n}\n");
-                            }
-                            break;
+                                break;
                         }
                     }
                 }
@@ -909,6 +1130,55 @@ namespace AnimeStudio
         }
     }
 
+    /// <summary>
+    /// Holds the compiled programs of a Shader in whichever shape the build uses.
+    ///
+    /// <para>Classic layout: one <see cref="ShaderProgram"/> per platform, selected by
+    /// platform index (the array passed to the converter).</para>
+    ///
+    /// <para>LOD-streaming layout (<c>m_EnableShaderLODStreaming</c>, live Endfield): one
+    /// <see cref="ShaderProgram"/> per platform <em>per ShaderLOD</em>, because every LOD
+    /// ships its own program index table.  Subshaders are resolved by their
+    /// <c>m_LOD</c>.</para>
+    /// </summary>
+    public class ShaderProgramSet
+    {
+        private readonly ShaderProgram[] byPlatform;
+        private readonly Dictionary<int, ShaderProgram[]> byLod;
+
+        public ShaderProgramSet(ShaderProgram[] byPlatform)
+        {
+            this.byPlatform = byPlatform;
+        }
+
+        public ShaderProgramSet(Dictionary<int, ShaderProgram[]> byLod)
+        {
+            this.byLod = byLod;
+            byPlatform = byLod.OrderByDescending(x => x.Value?.Sum(p => p?.m_SubPrograms?.Length ?? 0) ?? 0)
+                              .Select(x => x.Value)
+                              .FirstOrDefault();
+        }
+
+        /// <summary>Programs to use for a subshader with the given LOD.</summary>
+        public ShaderProgram[] Resolve(int lod)
+        {
+            if (byLod == null)
+            {
+                return byPlatform;
+            }
+
+            if (byLod.TryGetValue(lod, out var exact))
+            {
+                return exact;
+            }
+
+            // Unknown LOD: fall back to the richest table so the export still produces output.
+            return byLod.OrderByDescending(x => x.Value?.Sum(p => p?.m_SubPrograms?.Length ?? 0) ?? 0)
+                        .Select(x => x.Value)
+                        .FirstOrDefault() ?? byPlatform;
+        }
+    }
+
     public class ShaderProgram
     {
         public ShaderSubProgramEntry[] entries;
@@ -939,7 +1209,20 @@ namespace AnimeStudio
                 if (entry.Segment == segment)
                 {
                     reader.BaseStream.Position = entry.Offset;
-                    m_SubPrograms[i] = new ShaderSubProgram(reader, hasUpdatedGpuProgram);
+                    try
+                    {
+                        m_SubPrograms[i] = new ShaderSubProgram(reader, hasUpdatedGpuProgram);
+                    }
+                    catch (Exception e)
+                    {
+                        // The program index table also lists the programs of every other
+                        // graphics API the shader was ever built for (GLCore43 / GLES /
+                        // GLCore41 / GLCore32 have been observed), and those are stored in a
+                        // different layout.  Those entries are never referenced by a
+                        // subprogram of this build's platform, and ConvertSerializedSubPrograms
+                        // skips nulls, so leaving them undecoded is harmless.
+                        Logger.Verbose($"Skipping undecodable shader subprogram {i} (segment {segment}, offset {entry.Offset}): {e.Message}");
+                    }
                 }
             }
         }
@@ -1007,7 +1290,7 @@ namespace AnimeStudio
             //TODO
         }
 
-        public string Export()
+        public string Export(ShaderBindingContext bindingContext = null)
         {
             var sb = new StringBuilder();
             if (m_Keywords.Length > 0)
@@ -1135,7 +1418,13 @@ namespace AnimeStudio
                         try
                         {
                             sb.Append($"// hash: {ComputeHash64(m_ProgramCode):x8}\n");
-                            sb.Append(SpirVShaderConverter.Convert(m_ProgramCode));
+                            // Prefer GLSL: the SPIR-V listing is roughly 2.5x larger and much
+                            // harder to read. ConvertToGlsl returns null when spirv-cross is
+                            // missing or cannot handle the module, so the listing stays as the
+                            // fallback. With a binding context the anonymous GLSL identifiers
+                            // are renamed to the serialized uniform/property names.
+                            sb.Append(SpirVShaderConverter.ConvertToGlsl(m_ProgramCode, bindingContext)
+                                      ?? SpirVShaderConverter.Convert(m_ProgramCode));
                         }
                         catch (Exception e)
                         {

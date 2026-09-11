@@ -128,7 +128,14 @@ namespace Smolv
 					output.Write(SpirVHeaderMagic);
 					input.BaseStream.Position += sizeof(uint);
 					uint version = input.ReadUInt32();
-					output.Write(version);
+					// The version word packs the SMOL-V encoding revision in its top byte and the
+					// SPIR-V version below it.  Revision 1 packs MemberDecorate runs and zig-zag
+					// codes the Decorate target and the delta-from-result operands.
+					uint smolVersion = version >> 24;
+					bool smolV1 = smolVersion >= 1;
+					// Strip the SMOL-V revision byte: the emitted SPIR-V header must carry the
+					// canonical version word (e.g. 0x00010000), not revision<<24 | version.
+					output.Write(version & 0x00FFFFFF);
 					uint generator = input.ReadUInt32();
 					output.Write(generator);
 					int bound = input.ReadInt32();
@@ -190,10 +197,88 @@ namespace Smolv
 								return false;
 							}
 
-							int zds = prevDecorate + unchecked((int)value);
+							int decorateDelta = smolV1 ? ZigDecode(value) : unchecked((int)value);
+							int zds = prevDecorate + decorateDelta;
 							output.Write(zds);
 							prevDecorate = zds;
 							ioffs++;
+						}
+
+						// MemberDecorate: a run of decorations for one target id is packed into a single
+						// instruction (SMOL-V revision 1); expand it back into one instruction per decoration.
+						if (smolV1 && op == SpvOp.MemberDecorate)
+						{
+							if (input.BaseStream.Position >= inputEndPosition)
+							{
+								return false;
+							}
+
+							int memberCount = input.ReadByte();
+							int prevMemberIndex = 0;
+							int prevMemberOffset = 0;
+							for (int m = 0; m < memberCount; ++m)
+							{
+								if (!ReadVarint(input, out uint memberIndex))
+								{
+									return false;
+								}
+								prevMemberIndex += (int)memberIndex;
+
+								if (!ReadVarint(input, out uint memberDec))
+								{
+									return false;
+								}
+
+								int knownExtra = DecorationExtraOps((int)memberDec);
+								int memberLen;
+								if (knownExtra == -1)
+								{
+									if (!ReadVarint(input, out uint explicitLen))
+									{
+										return false;
+									}
+									memberLen = (int)explicitLen + 4;
+								}
+								else
+								{
+									memberLen = 4 + knownExtra;
+								}
+
+								if (m != 0)
+								{
+									output.Write((uint)((memberLen << 16) | (int)op));
+									output.Write(prevDecorate);
+								}
+
+								output.Write(prevMemberIndex);
+								output.Write(memberDec);
+
+								if (memberDec == 35) // Offset
+								{
+									if (memberLen != 5)
+									{
+										return false;
+									}
+									if (!ReadVarint(input, out uint memberOffset))
+									{
+										return false;
+									}
+									prevMemberOffset += (int)memberOffset;
+									output.Write(prevMemberOffset);
+								}
+								else
+								{
+									for (int k = 4; k < memberLen; ++k)
+									{
+										if (!ReadVarint(input, out uint operand))
+										{
+											return false;
+										}
+										output.Write(operand);
+									}
+								}
+							}
+							continue;
 						}
 
 						// Read this many IDs, that are relative to result ID
@@ -211,7 +296,7 @@ namespace Smolv
 								return false;
 							}
 
-							int zd = inverted ? ZigDecode(value) : unchecked((int)value);
+							int zd = (smolV1 || inverted) ? ZigDecode(value) : unchecked((int)value);
 							output.Write(prevResult - zd);
 						}
 
@@ -289,7 +374,8 @@ namespace Smolv
 			}
 
 			uint headerVersion = BitConverter.ToUInt32(data, 1 * sizeof(uint));
-			if (headerVersion < 0x00010000 || headerVersion > 0x00010300)
+			uint spirvVersion = headerVersion & 0x00FFFFFF;
+			if (spirvVersion < 0x00010000 || spirvVersion > 0x00010300)
 			{
 				// only support 1.0 through 1.3
 				return false;

@@ -512,9 +512,13 @@ namespace AnimeStudio
 
     public sealed class Mesh : NamedObject
     {
-        private bool m_Use16BitIndices = true;
+        public bool m_Use16BitIndices = true;
         public List<SubMesh> m_SubMeshes;
-        private uint[] m_IndexBuffer;
+        public AABB m_LocalAABB;
+        public int m_MeshUsageFlags;
+        public byte[] m_BakedConvexCollisionMesh;
+        public byte[] m_BakedTriangleCollisionMesh;
+        public uint[] m_IndexBuffer;
         public BlendShapeData m_Shapes;
         public Matrix4x4[] m_BindPose;
         public uint[] m_BoneNameHashes;
@@ -532,9 +536,9 @@ namespace AnimeStudio
         public float[] m_UV6;
         public float[] m_UV7;
         public float[] m_Tangents;
-        private VertexData m_VertexData;
-        private CompressedMesh m_CompressedMesh;
-        private StreamingInfo m_StreamData;
+        public VertexData m_VertexData;
+        public CompressedMesh m_CompressedMesh;
+        public StreamingInfo m_StreamData;
         private bool m_CollisionMeshBaked = false;
 
         public static bool HasVertexColorSkinning(SerializedType type) => type.Match("413A501B79022BF2DF389A82002FC81F");
@@ -746,7 +750,7 @@ namespace AnimeStudio
                 m_CompressedMesh = new CompressedMesh(reader);
             }
 
-            reader.Position += 24; //AABB m_LocalAABB
+            m_LocalAABB = new AABB(reader);
 
             if (version[0] < 3 || (version[0] == 3 && version[1] <= 4)) //3.4.2 and earlier
             {
@@ -767,7 +771,7 @@ namespace AnimeStudio
                 var m_ColliderType = reader.ReadInt32();
             }
 
-            int m_MeshUsageFlags = reader.ReadInt32();
+            m_MeshUsageFlags = reader.ReadInt32();
 
             if (version[0] > 2022 || (version[0] == 2022 && version[1] >= 1)) //2022.1 and up
             {
@@ -776,9 +780,9 @@ namespace AnimeStudio
 
             if (version[0] >= 5) //5.0 and up
             {
-                var m_BakedConvexCollisionMesh = reader.ReadUInt8Array();
+                m_BakedConvexCollisionMesh = reader.ReadUInt8Array();
                 reader.AlignStream();
-                var m_BakedTriangleCollisionMesh = reader.ReadUInt8Array();
+                m_BakedTriangleCollisionMesh = reader.ReadUInt8Array();
                 reader.AlignStream();
                 if (reader.Game.Type.IsBH3())
                 {

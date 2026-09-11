@@ -57,21 +57,27 @@ namespace AnimeStudio.CLI
                     var classTypeFilterList = new List<ClassIDType>();
                     for (int i = 0; i < o.TypeFilter.Length; i++)
                     {
-                        var typeStr = o.TypeFilter[i];
+                        foreach (var typeStrRaw in o.TypeFilter[i].Split(','))
+                        {
+                        var typeStr = typeStrRaw.Trim();
+                        if (typeStr.Length == 0)
+                        {
+                            continue;
+                        }
                         var type = ClassIDType.UnknownType;
                         var flag = TypeFlag.Both;
-                    
+
                         try
                         {
                             if (typeStr.Contains(':'))
                             {
                                 var param = typeStr.Split(':');
-                    
+
                                 flag = (TypeFlag)Enum.Parse(typeof(TypeFlag), param[1], true);
-                    
+
                                 typeStr = param[0];
                             }
-                    
+
                             type = (ClassIDType)Enum.Parse(typeof(ClassIDType), typeStr, true);
 
                             if (type == ClassIDType.Texture2D)
@@ -84,13 +90,14 @@ namespace AnimeStudio.CLI
                             }
                     
                             TypeFlags.SetType(type, flag.HasFlag(TypeFlag.Parse), flag.HasFlag(TypeFlag.Export));
-                    
+
                             classTypeFilterList.Add(type);
                         }
                         catch(Exception e)
                         {
                             Logger.Error($"{typeStr} has invalid format, skipping...");
                             continue;
+                        }
                         }
                     }
 

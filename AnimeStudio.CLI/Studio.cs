@@ -453,6 +453,9 @@ namespace AnimeStudio.CLI
                                 exportedCount++;
                             }
                             break;
+                        case ExportType.UnityAssets:
+                            exportedCount += UnityAssetExporter.Export(savePath, toExportAssets);
+                            return;
                     }
                 }
                 catch (Exception ex)

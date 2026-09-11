@@ -60,6 +60,7 @@ namespace AnimeStudio
             Games.Add(index++, new Game(GameType.GirlsFrontline, "Girls Frontline"));
             Games.Add(index++, new Game(GameType.Reverse1999, "Reverse: 1999"));
             Games.Add(index++, new Game(GameType.ArknightsEndfield, "Arknights Endfield"));
+            Games.Add(index++, new Game(GameType.ArknightsEndfieldNew, "Arknights Endfield (New)"));
             Games.Add(index++, new Game(GameType.ArknightsEndfieldCB3, "Arknights Endfield CBT3"));
             Games.Add(index++, new Game(GameType.ArknightsEndfieldCB2, "Arknights Endfield CBT2"));
             Games.Add(index++, new Game(GameType.ArknightsEndfieldCB1, "Arknights Endfield CBT1"));
@@ -102,12 +103,34 @@ namespace AnimeStudio
             return format;
         }
 
-        public static Game GetGame(string name) => Games.FirstOrDefault(x => x.Value.Name == name).Value;
+        /// <summary>
+        /// Short handles accepted by <see cref="GetGame(string)"/> on top of the enum names,
+        /// so the CLI / scripts can say <c>--game endfieldNew</c>.
+        /// </summary>
+        private static readonly Dictionary<string, GameType> GameAliases = new Dictionary<string, GameType>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "endfieldNew", GameType.ArknightsEndfieldNew },
+            { "endfield", GameType.ArknightsEndfield },
+        };
+
+        public static Game GetGame(string name)
+        {
+            var game = Games.FirstOrDefault(x => x.Value.Name == name).Value;
+            if (game != null)
+            {
+                return game;
+            }
+            if (!string.IsNullOrEmpty(name) && GameAliases.TryGetValue(name, out var aliased))
+            {
+                return GetGameByType(aliased);
+            }
+            return null;
+        }
         public static Game GetGameByDisplayName(string displayName) => Games.FirstOrDefault(x => x.Value.DisplayName == displayName).Value;
         public static int GetGameIndex(Game game) => Games.FirstOrDefault(x => x.Value == game).Key;
         public static Game[] GetGames() => Games.Values.ToArray();
-        public static string[] GetGameNames() => Games.Values.Select(x => x.Name).ToArray();
-        public static string SupportedGames() => $"Supported Games:\n{string.Join("\n", Games.Values.Select(x => x.Name))}";
+        public static string[] GetGameNames() => Games.Values.Select(x => x.Name).Concat(GameAliases.Keys).ToArray();
+        public static string SupportedGames() => $"Supported Games:\n{string.Join("\n", GetGameNames())}";
     }
 
     public record Game
@@ -225,6 +248,7 @@ namespace AnimeStudio
         GirlsFrontline,
         Reverse1999,
         ArknightsEndfield,
+        ArknightsEndfieldNew,
         ArknightsEndfieldCB3,
         ArknightsEndfieldCB2,
         ArknightsEndfieldCB1,
@@ -297,7 +321,18 @@ namespace AnimeStudio
         public static bool IsNaraka(this GameType type) => type == GameType.Naraka;
         public static bool IsOPFP(this GameType type) => type == GameType.OPFP;
         public static bool IsNetEase(this GameType type) => type == GameType.NetEase;
-        public static bool IsArknightsEndfield(this GameType type) => type == GameType.ArknightsEndfield;
+        /// <summary>
+        /// Live Endfield builds. <see cref="GameType.ArknightsEndfieldNew"/> is deliberately
+        /// included: that build only changed the <b>Shader</b> program-blob container
+        /// (<c>m_EnableShaderLODStreaming</c> + <c>subShaderBlobs</c> instead of
+        /// <c>m_UseExternalBlobs</c> + <c>PPtr&lt;SubShaderBinaryData&gt;</c>); every other
+        /// class (Material / Mesh / Animator / AnimationClip / AssetBundle ...) still uses the
+        /// live layout, so all existing Endfield special cases have to keep applying.
+        /// Use <see cref="IsArknightsEndfieldNew"/> where the two differ.
+        /// </summary>
+        public static bool IsArknightsEndfield(this GameType type) => type == GameType.ArknightsEndfield || type == GameType.ArknightsEndfieldNew;
+        /// <summary>True only for the build with streaming shader blobs (<c>subShaderBlobs</c>).</summary>
+        public static bool IsArknightsEndfieldNew(this GameType type) => type == GameType.ArknightsEndfieldNew;
         public static bool IsArknightsEndfieldCB3(this GameType type) => type == GameType.ArknightsEndfieldCB3;
         public static bool IsArknightsEndfieldCB2(this GameType type) => type == GameType.ArknightsEndfieldCB2;
         public static bool IsArknightsEndfieldCB1(this GameType type) => type == GameType.ArknightsEndfieldCB1;
@@ -351,7 +386,7 @@ namespace AnimeStudio
 
         public static bool IsArknightsEndfieldGroup(this GameType type) => type switch
         {
-            GameType.ArknightsEndfieldCB2 or GameType.ArknightsEndfieldCB3 or GameType.ArknightsEndfield => true,
+            GameType.ArknightsEndfieldCB2 or GameType.ArknightsEndfieldCB3 or GameType.ArknightsEndfieldNew or GameType.ArknightsEndfield => true,
             _ => false,
         };
     }
