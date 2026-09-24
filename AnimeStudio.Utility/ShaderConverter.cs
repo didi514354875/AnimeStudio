@@ -25,6 +25,14 @@ namespace AnimeStudio
             Environment.GetEnvironmentVariable("ANIMESTUDIO_SHADER_VARIANTS"),
             "first", StringComparison.OrdinalIgnoreCase);
 
+        /// <summary>
+        /// 默认 <c>true</c>：只导 <c>Properties</c> + 占位实现（见 <see cref="ConvertPlaceholder"/>）。
+        /// 设 <c>ANIMESTUDIO_SHADER_FULL=1</c> 可恢复导出原始程序反汇编的旧行为。
+        /// </summary>
+        public static readonly bool PlaceholderOnly = !string.Equals(
+            Environment.GetEnvironmentVariable("ANIMESTUDIO_SHADER_FULL"),
+            "1", StringComparison.OrdinalIgnoreCase);
+
         public static string Convert(this Shader shader)
         {
             if (shader.platformInfos != null)
@@ -61,6 +69,221 @@ namespace AnimeStudio
             }
 
             return header + Encoding.UTF8.GetString(shader.m_Script);
+        }
+
+        /// <summary>
+        /// 只导「属性 + 占位实现」的 .shader（默认路径）：
+        ///   - <c>Properties</c> 块来自资源本体 —— 属性名 / 类型 / 默认值 / 显示名 / 特性全部保真
+        ///   - <c>SubShader</c>/<c>Pass</c> 是一个通用 UNLIT 占位实现，**不是**原始 GPU 程序
+        /// 目的：让材质能在 Unity 里正常导入（属性名、贴图、颜色对得上），模型可见可调。
+        /// 不导原始实现的原因：.ab 里只有目标 GPU 的编译字节码，无法还原成可移植的 HLSL。
+        /// 设 <c>ANIMESTUDIO_SHADER_FULL=1</c> 可恢复「原始程序反汇编」的旧行为。
+        /// </summary>
+        public static string ConvertPlaceholder(this Shader shader)
+        {
+            var pf = shader.m_ParsedForm;
+            var name = pf?.m_Name;
+            if (string.IsNullOrEmpty(name))
+            {
+                name = string.IsNullOrEmpty(shader.m_Name) ? "Hidden/AnimeStudio/Placeholder" : shader.m_Name;
+            }
+
+            var props = pf?.m_PropInfo?.m_Props;
+            var texProp = PickProperty(props, SerializedPropertyType.Texture);
+            var colProp = PickProperty(props, SerializedPropertyType.Color);
+
+            var sb = new StringBuilder();
+            sb.AppendLine("// ===========================================================================");
+            sb.AppendLine("// 占位 Shader（由 AnimeStudio 生成）");
+            sb.AppendLine("//   Properties : 来自资源本体（属性名 / 类型 / 默认值 / 显示名 / 特性 全部保真）");
+            sb.AppendLine("//   SubShader   : **URP 默认光照占位实现**（主光+阴影 / SH 环境光 / 附加光 / 雾）");
+            sb.AppendLine("//                 —— 原版实现只有目标 GPU 的编译字节码，无法还原；这里给一个能正常受光的等价外观");
+            sb.AppendLine("//   不导原始实现的原因：.ab 里只有目标 GPU 的编译字节码，无法还原成可移植 HLSL");
+            sb.AppendLine("// ===========================================================================");
+            sb.Append($"Shader \"{name}\" {{\n");
+
+            if (props != null && props.Count > 0)
+            {
+                sb.Append(ConvertSerializedProperties(pf.m_PropInfo));
+            }
+            else
+            {
+                sb.Append("Properties {\n}\n");
+            }
+
+            // ---------------- URP 默认光照模板 ----------------
+            // 主光（含阴影）+ SH 环境光 + 附加光 + 雾；另有 ShadowCaster / DepthOnly 两个必要 pass。
+            string texDecl = texProp != null
+                ? $"    TEXTURE2D({texProp}); SAMPLER(sampler{texProp});\n    float4 {texProp}_ST;\n"
+                : "";
+            string colDecl = colProp != null ? $"    half4 {colProp};\n" : "";
+            string uvExpr = texProp != null ? $"TRANSFORM_TEX(IN.uv, {texProp})" : "IN.uv";
+            string albedoExpr;
+            if (texProp != null && colProp != null)
+            {
+                albedoExpr = $"SAMPLE_TEXTURE2D({texProp}, sampler{texProp}, IN.uv).rgb * {colProp}.rgb";
+            }
+            else if (texProp != null)
+            {
+                albedoExpr = $"SAMPLE_TEXTURE2D({texProp}, sampler{texProp}, IN.uv).rgb";
+            }
+            else if (colProp != null)
+            {
+                albedoExpr = $"{colProp}.rgb";
+            }
+            else
+            {
+                albedoExpr = "half3(0.8, 0.8, 0.8)";
+            }
+
+            sb.Append("SubShader {\n");
+            sb.Append("  Tags { \"RenderType\" = \"Opaque\" \"Queue\" = \"Geometry\" \"RenderPipeline\" = \"UniversalPipeline\" }\n");
+            sb.Append("  LOD 100\n");
+            sb.Append("  Pass {\n");
+            sb.Append("    Name \"ForwardLit\"\n");
+            sb.Append("    Tags { \"LightMode\" = \"UniversalForward\" }\n");
+            sb.Append("    Cull Back\n");
+            sb.Append("    ZWrite On\n");
+            sb.Append("    HLSLPROGRAM\n");
+            sb.Append("    #pragma vertex vert\n");
+            sb.Append("    #pragma fragment frag\n");
+            sb.Append("    #pragma multi_compile _ _MAIN_LIGHT_SHADOWS _MAIN_LIGHT_SHADOWS_CASCADE\n");
+            sb.Append("    #pragma multi_compile _ _ADDITIONAL_LIGHTS_VERTEX _ADDITIONAL_LIGHTS\n");
+            sb.Append("    #pragma multi_compile_fragment _ _SHADOWS_SOFT\n");
+            sb.Append("    #pragma multi_compile_fog\n");
+            sb.Append("    #include \"Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl\"\n");
+            sb.Append("    #include \"Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl\"\n\n");
+            sb.Append(texDecl);
+            sb.Append(colDecl);
+            sb.Append("\n");
+            sb.Append("    struct Attributes { float4 positionOS : POSITION; float3 normalOS : NORMAL; float2 uv : TEXCOORD0; };\n");
+            sb.Append("    struct Varyings { float4 positionHCS : SV_POSITION; float2 uv : TEXCOORD0; float3 normalWS : TEXCOORD1; float3 positionWS : TEXCOORD2; float fogFactor : TEXCOORD3; };\n\n");
+            sb.Append("    Varyings vert (Attributes IN) {\n");
+            sb.Append("        Varyings OUT;\n");
+            sb.Append("        VertexPositionInputs p = GetVertexPositionInputs(IN.positionOS.xyz);\n");
+            sb.Append("        OUT.positionHCS = p.positionCS;\n");
+            sb.Append("        OUT.positionWS = p.positionWS;\n");
+            sb.Append("        OUT.normalWS = TransformObjectToWorldNormal(IN.normalOS);\n");
+            sb.Append($"        OUT.uv = {uvExpr};\n");
+            sb.Append("        OUT.fogFactor = ComputeFogFactor(p.positionCS.z);\n");
+            sb.Append("        return OUT;\n");
+            sb.Append("    }\n\n");
+            sb.Append("    half4 frag (Varyings IN) : SV_Target {\n");
+            sb.Append("        half3 albedo = " + albedoExpr + ";\n");
+            sb.Append("        float3 normalWS = normalize(IN.normalWS);\n\n");
+            sb.Append("        half3 lighting = SampleSH(normalWS);                       // 环境光（球谐）\n");
+            sb.Append("        float4 shadowCoord = TransformWorldToShadowCoord(IN.positionWS);\n");
+            sb.Append("        Light mainLight = GetMainLight(shadowCoord);\n");
+            sb.Append("        lighting += mainLight.color * (saturate(dot(normalWS, mainLight.direction)) * mainLight.shadowAttenuation);\n");
+            sb.Append("        #ifdef _ADDITIONAL_LIGHTS\n");
+            sb.Append("        uint lightCount = GetAdditionalLightsCount();\n");
+            sb.Append("        for (uint li = 0u; li < lightCount; ++li) {\n");
+            sb.Append("            Light addLight = GetAdditionalLight(li, IN.positionWS);\n");
+            sb.Append("            lighting += addLight.color * (saturate(dot(normalWS, addLight.direction))\n");
+            sb.Append("                        * addLight.distanceAttenuation * addLight.shadowAttenuation);\n");
+            sb.Append("        }\n");
+            sb.Append("        #endif\n\n");
+            sb.Append("        half3 color = albedo * lighting;\n");
+            sb.Append("        color = MixFog(color, IN.fogFactor);\n");
+            sb.Append("        return half4(color, 1);\n");
+            sb.Append("    }\n");
+            sb.Append("    ENDHLSL\n");
+            sb.Append("  }\n\n");
+            // 阴影投射（URP 需要）
+            sb.Append("  Pass {\n");
+            sb.Append("    Name \"ShadowCaster\"\n");
+            sb.Append("    Tags { \"LightMode\" = \"ShadowCaster\" }\n");
+            sb.Append("    ZWrite On ZTest LEqual ColorMask 0\n");
+            sb.Append("    Cull Back\n");
+            sb.Append("    HLSLPROGRAM\n");
+            sb.Append("    #pragma vertex shadowVert\n");
+            sb.Append("    #pragma fragment shadowFrag\n");
+            sb.Append("    #include \"Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl\"\n");
+            sb.Append("    #include \"Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl\"\n");
+            sb.Append("    float3 _LightDirection;\n\n");
+            sb.Append("    struct SAttrs { float4 positionOS : POSITION; float3 normalOS : NORMAL; };\n");
+            sb.Append("    struct SVary { float4 positionCS : SV_POSITION; };\n\n");
+            sb.Append("    SVary shadowVert (SAttrs IN) {\n");
+            sb.Append("        SVary OUT;\n");
+            sb.Append("        float3 posWS = TransformObjectToWorld(IN.positionOS.xyz);\n");
+            sb.Append("        float3 nrmWS = TransformObjectToWorldNormal(IN.normalOS);\n");
+            sb.Append("        OUT.positionCS = TransformWorldToHClip(ApplyShadowBias(posWS, nrmWS, _LightDirection));\n");
+            sb.Append("        return OUT;\n");
+            sb.Append("    }\n");
+            sb.Append("    half4 shadowFrag (SVary IN) : SV_Target { return 0; }\n");
+            sb.Append("    ENDHLSL\n");
+            sb.Append("  }\n\n");
+            // 深度（URP 的 DepthPrepass / SSAO 需要）
+            sb.Append("  Pass {\n");
+            sb.Append("    Name \"DepthOnly\"\n");
+            sb.Append("    Tags { \"LightMode\" = \"DepthOnly\" }\n");
+            sb.Append("    ZWrite On ColorMask R\n");
+            sb.Append("    Cull Back\n");
+            sb.Append("    HLSLPROGRAM\n");
+            sb.Append("    #pragma vertex depthVert\n");
+            sb.Append("    #pragma fragment depthFrag\n");
+            sb.Append("    #include \"Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl\"\n\n");
+            sb.Append("    struct DAttrs { float4 positionOS : POSITION; };\n");
+            sb.Append("    struct DVary { float4 positionCS : SV_POSITION; };\n\n");
+            sb.Append("    DVary depthVert (DAttrs IN) {\n");
+            sb.Append("        DVary OUT;\n");
+            sb.Append("        OUT.positionCS = TransformObjectToHClip(IN.positionOS.xyz);\n");
+            sb.Append("        return OUT;\n");
+            sb.Append("    }\n");
+            sb.Append("    half4 depthFrag (DVary IN) : SV_Target { return 0; }\n");
+            sb.Append("    ENDHLSL\n");
+            sb.Append("  }\n");
+            sb.Append("}\n");
+
+            if (!string.IsNullOrEmpty(pf?.m_FallbackName))
+            {
+                sb.Append($"Fallback \"{pf.m_FallbackName}\"\n");
+            }
+            sb.Append("}\n");
+            return sb.ToString();
+        }
+
+        /// <summary>优先挑选贴图/颜色属性的候选名（按游戏中常见的命名习惯排序）。</summary>
+        private static readonly string[] TexPreference =
+            { "_BaseColorMap", "_BaseMap", "_MainTex", "_AlbedoMap", "_DiffuseMap", "_BaseTex", "_Texture" };
+
+        private static readonly string[] ColPreference =
+            { "_BaseColor", "_Color", "_TintColor", "_Tint", "_BaseTintColor" };
+
+        private static string PickProperty(List<SerializedProperty> props, SerializedPropertyType type)
+        {
+            if (props == null)
+            {
+                return null;
+            }
+            var pref = type == SerializedPropertyType.Texture ? TexPreference : ColPreference;
+            foreach (var want in pref)
+            {
+                foreach (var p in props)
+                {
+                    if (p.m_Type == type && string.Equals(p.m_Name, want, StringComparison.Ordinal))
+                    {
+                        return p.m_Name;
+                    }
+                }
+            }
+            // 退而求其次：取第一个同类型属性（贴图只接受 2D，避免在 sampler2D 里塞 Cube/3D）
+            foreach (var p in props)
+            {
+                if (p.m_Type != type)
+                {
+                    continue;
+                }
+                if (type == SerializedPropertyType.Texture
+                    && p.m_DefTexture != null
+                    && p.m_DefTexture.m_TexDim != TextureDimension.Tex2D
+                    && p.m_DefTexture.m_TexDim != TextureDimension.Any)
+                {
+                    continue;
+                }
+                return p.m_Name;
+            }
+            return null;
         }
 
         private static string ConvertSerializedShader(Shader shader)

@@ -1908,6 +1908,15 @@ namespace AnimeStudio
         public List<GenericBinding> genericBindings;
         public List<PPtr<Object>> pptrCurveMapping;
 
+        /// <summary>
+        /// 【不序列化】导出时要剔除的 `(classID, attribute)` 对。
+        /// 转换器丢弃「占位名 float 轨道」（attribute 在源数据里是序号，例如 typetree_0..146）时
+        /// 会把它们登记进来，导出 binding 表时一并去掉 —— 否则 .anim 里会留下
+        /// `classID: 95`(Animator) + `path: 0` 的孤儿 binding（表现为一堆 Animator 空节点）。
+        /// 用精确配对而不是按 classID 一刀切，真实 muscle 曲线的 binding 不受影响。
+        /// </summary>
+        public HashSet<(ClassIDType, uint)> droppedBindings;
+
         public AnimationClipBindingConstant() { }
 
         public AnimationClipBindingConstant(ObjectReader reader)
@@ -1936,7 +1945,12 @@ namespace AnimeStudio
         public YAMLNode ExportYAML(int[] version)
         {
             var node = new YAMLMappingNode();
-            node.Add(nameof(genericBindings), genericBindings.ExportYAML(version));
+            var list = genericBindings;
+            if (droppedBindings != null && droppedBindings.Count > 0)
+            {
+                list = genericBindings.Where(b => !droppedBindings.Contains((b.typeID, b.attribute))).ToList();
+            }
+            node.Add(nameof(genericBindings), list.ExportYAML(version));
             node.Add(nameof(pptrCurveMapping), pptrCurveMapping.ExportYAML(version));
             return node;
         }

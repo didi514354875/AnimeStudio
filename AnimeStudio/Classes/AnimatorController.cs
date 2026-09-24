@@ -419,6 +419,12 @@ namespace AnimeStudio
         public float m_CycleOffset;
         public bool m_Mirror;
 
+        /// <summary>
+        /// Endfield-only.  Upstream read this into a local and discarded it; kept because it is
+        /// the CRC-32 of the owning state's name and lets a motion be attributed to a state.
+        /// </summary>
+        public uint m_StateNameHash;
+
         private static bool HasTriangles(SerializedType type) => type.Match("6226663645CFE20F51EFFE2F89DDB650"); // gi 6.4
 
         public BlendTreeNodeConstant(ObjectReader reader)
@@ -481,7 +487,7 @@ namespace AnimeStudio
                 m_CycleOffset = reader.ReadSingle();
                 if (reader.Game.Type.IsArknightsEndfieldGroup())
                 {
-                    var m_StateNameHash = reader.ReadUInt32();
+                    m_StateNameHash = reader.ReadUInt32();
                 }
                 m_Mirror = reader.ReadBoolean();
                 reader.AlignStream();
@@ -849,25 +855,112 @@ namespace AnimeStudio
         public Dictionary<uint, string> m_TOS;
         public List<PPtr<AnimationClip>> m_AnimationClips;
 
+        /// <summary>
+        /// Baked runtime controller (layers, state machines, states, transitions, blend trees,
+        /// value arrays).  Upstream discarded this into a local variable, so nothing could be
+        /// exported from it.  The shipped bundle carries <b>no</b> editor-form data
+        /// (m_AnimatorParameters / m_AnimatorLayers), so this is the only source of truth.
+        /// </summary>
+        public ControllerConstant m_Controller;
+
+        /// <summary>
+        /// Live-build name table: a plain <c>vector&lt;string&gt;</c> (field <c>m_TOSData</c>).
+        /// The older builds serialised a <c>map&lt;uint,string&gt;</c> instead, which is what
+        /// upstream reads — reading the new form as the old one desynchronises the stream.
+        /// </summary>
+        public List<string> m_TOSData;
+
+        /// <summary>HG-only curve masks, present for Arknights: Endfield builds.</summary>
+        public PPtr<HGAnimationCurveMask>[] m_AnimationCurveMasks;
+
+        /// <summary>
+        /// Unity's <c>Animator.StringToHash</c> is a plain CRC-32 (verified: crc32("Base Layer")
+        /// == 756556552 == the LayerConstant.m_Binding observed in the shipped bundle), so the
+        /// hashes the runtime stores can be mapped back to the strings in <see cref="m_TOSData"/>.
+        /// </summary>
+        private static readonly uint[] Crc32Table = BuildCrc32Table();
+
+        private static uint[] BuildCrc32Table()
+        {
+            var table = new uint[256];
+            for (uint i = 0; i < 256; i++)
+            {
+                var c = i;
+                for (var k = 0; k < 8; k++)
+                {
+                    c = (c & 1) != 0 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+                }
+                table[i] = c;
+            }
+            return table;
+        }
+
+        public static uint StringToHash(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return 0;
+            }
+            var crc = 0xFFFFFFFFu;
+            foreach (var ch in value)
+            {
+                // Unity hashes UTF-8 bytes; every controller identifier is ASCII in practice,
+                // but encode properly so non-ASCII names still match.
+                var code = ch;
+                if (code < 0x80)
+                {
+                    crc = Crc32Table[(crc ^ code) & 0xFF] ^ (crc >> 8);
+                }
+                else
+                {
+                    var bytes = Encoding.UTF8.GetBytes(ch.ToString());
+                    foreach (var b in bytes)
+                    {
+                        crc = Crc32Table[(crc ^ b) & 0xFF] ^ (crc >> 8);
+                    }
+                }
+            }
+            return crc ^ 0xFFFFFFFFu;
+        }
+
         public AnimatorController(ObjectReader reader) : base(reader)
         {
             var m_ControllerSize = reader.ReadUInt32();
-            var m_Controller = new ControllerConstant(reader);
+            m_Controller = new ControllerConstant(reader);
 
-            int tosSize = reader.ReadInt32();
-            m_TOS = new Dictionary<uint, string>();
-            for (int i = 0; i < tosSize; i++)
+            if (reader.Game.Type.IsArknightsEndfieldNew())
             {
-                m_TOS.Add(reader.ReadUInt32(), reader.ReadAlignedString());
+                // vector<string> m_TOSData
+                var tosCount = reader.ReadInt32();
+                m_TOSData = new List<string>(tosCount);
+                m_TOS = new Dictionary<uint, string>(tosCount);
+                for (var i = 0; i < tosCount; i++)
+                {
+                    var name = reader.ReadAlignedString();
+                    m_TOSData.Add(name);
+                    if (!string.IsNullOrEmpty(name))
+                    {
+                        m_TOS[StringToHash(name)] = name;
+                    }
+                }
+            }
+            else
+            {
+                int tosSize = reader.ReadInt32();
+                m_TOS = new Dictionary<uint, string>();
+                for (int i = 0; i < tosSize; i++)
+                {
+                    m_TOS.Add(reader.ReadUInt32(), reader.ReadAlignedString());
+                }
             }
 
             if (reader.Game.Type.IsArknightsEndfieldCB3() || reader.Game.Type.IsArknightsEndfield())
             {
                 int animationCurveMaskSize = reader.ReadInt32();
-                var m_AnimationCurveMask = new PPtr<HGAnimationCurveMask>[animationCurveMaskSize];
+                m_AnimationCurveMasks = new PPtr<HGAnimationCurveMask>[animationCurveMaskSize];
                 for (int i = 0; i < animationCurveMaskSize; i++)
                 {
-                    m_AnimationCurveMask[i] = new PPtr<HGAnimationCurveMask>(reader);
+                    m_AnimationCurveMasks[i] = new PPtr<HGAnimationCurveMask>(reader);
                 }
             }
 

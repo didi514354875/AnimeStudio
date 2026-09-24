@@ -151,16 +151,27 @@ namespace AnimeStudio.CLI
                 var files = o.Input.Attributes.HasFlag(FileAttributes.Directory) ? Directory.GetFiles(o.Input.FullName, "*.*", SearchOption.AllDirectories).OrderBy(x => x.Length).ToArray() : new string[] { o.Input.FullName };
                 Logger.Info($"Found {files.Length} files");
 
+                // ACL 探针：ANIMESTUDIO_ACL_PROBE=<out.json> 时只跑探针并退出
+                var aclProbeOut = Environment.GetEnvironmentVariable("ANIMESTUDIO_ACL_PROBE");
+                if (!string.IsNullOrEmpty(aclProbeOut))
+                {
+                    AclProbe.Run(files, aclProbeOut);
+                    return;
+                }
+
                 if (o.MapOp.HasFlag(MapOpType.CABMap))
                 {
+                    // NOTE: this if/else was inverted upstream (CABMap alone loaded a map that
+                    // was never built, and CABMap|Load rebuilt it every time).  Aligned with the
+                    // AssetMap block below: Load bit => load the map, otherwise build it.
                     if (o.MapOp.HasFlag(MapOpType.Load))
-                    {
-                        AssetsHelper.BuildCABMap(files, o.MapName, o.Input.FullName, game);
-                    }
-                    else
                     {
                         AssetsHelper.LoadCABMapInternal(o.MapName);
                         assetsManager.ResolveDependencies = true;
+                    }
+                    else
+                    {
+                        AssetsHelper.BuildCABMap(files, o.MapName, o.Input.FullName, game);
                     }
                 }
                 if (o.MapOp.HasFlag(MapOpType.AssetMap))
@@ -180,6 +191,38 @@ namespace AnimeStudio.CLI
                 }
                 if (o.MapOp.Equals(MapOpType.None) || o.MapOp.HasFlag(MapOpType.Load))
                 {
+                    // ── 预扫：汇总所有 Avatar 的 m_TOS（hash → 骨骼全路径）。
+                    // 逐文件导出时 clip 与 Avatar 常不在同一 bundle，局部 FindTOS 会拿不到路径，
+                    // 曲线 path 会退化成 path_<hash>（Unity 无法绑定）。
+                    if (Environment.GetEnvironmentVariable("ANIMESTUDIO_TOS_PREPASS") == "1")
+                    {
+                        Logger.Info("TOS pre-pass: collecting Avatar m_TOS...");
+                        var pre = 0;
+                        foreach (var pf in files)
+                        {
+                            assetsManager.LoadFiles(pf);
+                            if (assetsManager.assetsFileList.Count > 0)
+                            {
+                                foreach (var af in assetsManager.assetsFileList)
+                                {
+                                    foreach (var obj in af.Objects)
+                                    {
+                                        if (obj is Avatar av)
+                                        {
+                                            AnimationClipExtensions.AddGlobalTOS(av);
+                                        }
+                                    }
+                                }
+                            }
+                            assetsManager.Clear();
+                            if (++pre % 500 == 0)
+                            {
+                                Logger.Info($"[tos-prepass] {pre}/{files.Length}  (paths={AnimationClipExtensions.GlobalTOS.Count})");
+                            }
+                        }
+                        Logger.Info($"[tos-prepass] done: {AnimationClipExtensions.GlobalTOS.Count} bone paths");
+                    }
+
                     var i = 0;
 
                     var path = Path.GetDirectoryName(Path.GetFullPath(files[0]));

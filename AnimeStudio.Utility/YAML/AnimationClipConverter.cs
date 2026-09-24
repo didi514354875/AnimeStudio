@@ -3,11 +3,35 @@ using System.Linq;
 using System.Collections.Generic;
 using System.Text.RegularExpressions;
 using SevenZip;
+using ACLLibs;
 
 namespace AnimeStudio
 {
+
     public class AnimationClipConverter
     {
+        /// <summary>
+        /// 占位名 float 曲线（`typetree_` / `script_` / `missed_`）默认**丢弃**。
+        /// 理由：源数据里这些 binding 的 `attribute` 是**序号**而非属性名（实测 0..146 连续），
+        /// 属于游戏自己的自定义 float 轨道；照原样写出去就是每个 clip 上百个
+        /// `classID: 95`(Animator) + 空 path + `attribute: typetree_N` 的**空节点**，
+        /// 让 clip 的节点集合和模型骨骼对不上。
+        /// 需要保留（例如想自己解析这些轨道）时设 `ANIMESTUDIO_KEEP_PLACEHOLDER_FLOATS=1`。
+        /// </summary>
+        public static bool KeepPlaceholderFloats =>
+            Environment.GetEnvironmentVariable("ANIMESTUDIO_KEEP_PLACEHOLDER_FLOATS") == "1";
+
+        private int m_droppedPlaceholderFloats;
+
+        /// <summary>把被丢弃的占位轨道登记到 clip 的 binding 表，导出时一并剔除。</summary>
+        private void RegisterDroppedBinding(GenericBinding binding)
+        {
+            var bc = animationClip.m_ClipBindingConstant;
+            if (bc == null) return;
+            if (bc.droppedBindings == null) bc.droppedBindings = new HashSet<(ClassIDType, uint)>();
+            bc.droppedBindings.Add((binding.typeID, binding.attribute));
+        }
+
         public static readonly Regex UnknownPathRegex = new Regex($@"^{UnknownPathPrefix}[0-9]{{1,10}}$", RegexOptions.Compiled);
 
         private const string UnknownPathPrefix = "path_";
@@ -75,7 +99,181 @@ namespace AnimeStudio
             {
                 ProcessConstant(m_Clip, bindings, tos, lastFrame);
             }
+            // endfield：数据不在 m_Clip 里，而在 animationClip.m_AclCompressedBuffer
+            var aclFrame = ProcessEndfieldACLBuffer(tos);
+            if (aclFrame > lastFrame)
+            {
+                lastFrame = aclFrame;
+            }
             CreateCurves();
+        }
+
+        /// <summary>
+        /// endfield 专用：从 <c>m_AclCompressedBuffer</c> 解出 ACL 轨并铺成曲线。
+        ///
+        /// 映射（已用 prefab 的骨骼静止坐标逐条对账验证：60/60，56 个精确到小数第 4 位，
+        /// 另外 4 个是 IK 目标——它们的位置本来就被动画驱动）：
+        /// <list type="bullet">
+        /// <item>变换轨 i → 位置 = 第 i 个 <c>attribute==1</c> 的绑定；旋转 = 第 i 个 <c>attribute==2</c> 的绑定；
+        ///       缩放 = 同 path 的 <c>attribute==3</c> 绑定（只有 8 个 path 有）</item>
+        /// <item>float 轨 j → 绑定表尾部 <c>FloatCurveCount</c> 个绑定里的第 j 个</item>
+        /// </list>
+        /// 实测：349 个位置绑定、349 个旋转绑定、8 个缩放绑定、152 个 float 绑定，
+        /// 与 <c>OutputTrackCount=349</c> / <c>FloatCurveCount=152</c> 完全一致。
+        ///
+        /// 优化：**恒定的通道只写 1 个关键帧**（Unity 视单关键帧为常量），
+        /// 否则每条轨都铺 73 帧会让产物膨胀十几倍（实测大量轨本来就是静止偏移）。
+        /// </summary>
+        private float ProcessEndfieldACLBuffer(Dictionary<uint, string> tos)
+        {
+            var acb = animationClip.m_AclCompressedBuffer;
+            if (acb == null || acb.TransformBufferData == null || acb.TransformBufferData.Length < 16)
+            {
+                return 0f;
+            }
+            if (!EndfieldACL.TryDecode(acb.TransformBufferData, out var tv, out var tt) || tt.Length == 0)
+            {
+                return 0f;
+            }
+
+            var bindings = animationClip.m_ClipBindingConstant;
+            if (bindings?.genericBindings == null || bindings.genericBindings.Count == 0)
+            {
+                return 0f;
+            }
+
+            int nt = acb.OutputTrackCount;
+            int nf = acb.FloatCurveCount;
+            if (nt <= 0)
+            {
+                return 0f;
+            }
+            int samples = tv.Length / (nt * 10);
+            var last = tt[tt.Length - 1];
+            animationClip.m_Compressed = false;      // 曲线已展开，输出不再是“压缩态”
+            var zero = new float[4];
+
+            var posList = bindings.genericBindings
+                .Where(x => x.attribute == 1 && x.typeID == ClassIDType.Transform).ToList();
+            var rotList = bindings.genericBindings
+                .Where(x => x.attribute == 2 && x.typeID == ClassIDType.Transform).ToList();
+            var scaleByPath = bindings.genericBindings
+                .Where(x => x.attribute == 3 && x.typeID == ClassIDType.Transform)
+                .GroupBy(x => x.path).ToDictionary(g => g.Key, g => g.First());
+
+            for (int i = 0; i < nt; i++)
+            {
+                int o0 = i * 10;                                   // 首采样的偏移
+                bool rotConst = true, posConst = true, sclConst = true;
+                for (int s = 1; s < samples; s++)
+                {
+                    int o = s * nt * 10 + i * 10;
+                    for (int k = 0; k < 4; k++) if (Math.Abs(tv[o + k] - tv[o0 + k]) > 1e-5) rotConst = false;
+                    for (int k = 4; k < 7; k++) if (Math.Abs(tv[o + k] - tv[o0 + k]) > 1e-5) posConst = false;
+                    for (int k = 7; k < 10; k++) if (Math.Abs(tv[o + k] - tv[o0 + k]) > 1e-5) sclConst = false;
+                }
+
+                if (i < rotList.Count)
+                {
+                    var path = GetCurvePath(tos, rotList[i].path);
+                    AddTransformCurve(0f, 2, tv, zero, zero, o0, path);
+                    if (!rotConst)
+                    {
+                        for (int s = 1; s < samples; s++)
+                        {
+                            AddTransformCurve(tt[s], 2, tv, zero, zero, s * nt * 10 + i * 10, path);
+                        }
+                    }
+                }
+                if (i < posList.Count)
+                {
+                    var path = GetCurvePath(tos, posList[i].path);
+                    AddTransformCurve(0f, 1, tv, zero, zero, o0 + 4, path);
+                    if (!posConst)
+                    {
+                        for (int s = 1; s < samples; s++)
+                        {
+                            AddTransformCurve(tt[s], 1, tv, zero, zero, s * nt * 10 + i * 10 + 4, path);
+                        }
+                    }
+                    if (scaleByPath.TryGetValue(posList[i].path, out var sb))
+                    {
+                        var spath = GetCurvePath(tos, sb.path);
+                        AddTransformCurve(0f, 3, tv, zero, zero, o0 + 7, spath);
+                        if (!sclConst)
+                        {
+                            for (int s = 1; s < samples; s++)
+                            {
+                                AddTransformCurve(tt[s], 3, tv, zero, zero, s * nt * 10 + i * 10 + 7, spath);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (nf > 0 && EndfieldACL.TryDecode(acb.FloatBufferData, out var fv, out _))
+            {                int fSamples = fv.Length / nf;
+                int floatStart = bindings.genericBindings.Count - nf;
+                if (System.Environment.GetEnvironmentVariable("ANIMESTUDIO_ACL_DEBUG") == "1")
+                {
+                    Console.WriteLine(string.Format(
+                        "[ACLDBG] {0} nt={1} nf={2} tvLen={3} tSamples={4} fvLen={5} fSamples={6} bindings={7} floatStart={8}",
+                        animationClip.m_Name, nt, nf, tv.Length, tv.Length / Math.Max(1, nt * 10),
+                        fv.Length, fSamples, bindings.genericBindings.Count, floatStart));
+                    for (int jj = 0; jj < nf; jj++)
+                    {
+                        int fj = floatStart + jj;
+                        if (fj < 0 || fj >= bindings.genericBindings.Count) break;
+                        var bb2 = bindings.genericBindings[fj];
+                        float mn2 = float.MaxValue, mx2 = float.MinValue;
+                        for (int s2 = 0; s2 < fSamples; s2++)
+                        {
+                            float v2 = fv[s2 * nf + jj];
+                            if (v2 < mn2) mn2 = v2;
+                            if (v2 > mx2) mx2 = v2;
+                        }
+                        string nm2 = "-";
+                        try
+                        {
+                            if ((BindingCustomType)bb2.customType == BindingCustomType.AnimatorMuscle)
+                                nm2 = bb2.GetHumanoidMuscle().ToAttributeString();
+                        }
+                        catch { nm2 = "<ERR>"; }
+                        Console.WriteLine(string.Format(
+                            "[ACLDBG] j={0,3} attr={1,4} classID={2,4} custom={3} name={4,-32} v0={5,9:F4} min={6,9:F4} max={7,9:F4}",
+                            jj, bb2.attribute, (int)bb2.typeID, bb2.customType, nm2, fv[jj], mn2, mx2));
+                    }
+                }
+                for (int j = 0; j < nf; j++)
+                {
+                    int fi = floatStart + j;
+                    if (fi < 0 || fi >= bindings.genericBindings.Count)
+                    {
+                        break;
+                    }
+                    var b = bindings.genericBindings[fi];
+                    var path = GetCurvePath(tos, b.path);
+                    bool cst = true;
+                    for (int s = 1; s < fSamples; s++)
+                    {
+                        if (Math.Abs(fv[s * nf + j] - fv[j]) > 1e-5) { cst = false; break; }
+                    }
+                    // ★ 必须按 customType 分派：这些轨道的 customType 是
+                    //   `AnimatorMuscle(8)`（人形肌肉），要走 AddCustomCurve→AddAnimatorMuscleCurve
+                    //   才能写出真实肌肉属性名；直接 AddDefaultCurve 会退化成
+                    //   `typetree_<序号>` + 空 path + classID 95 ⇒ Unity 侧全是 Missing。
+                    AddFloatTrack(bindings, b, path, 0f, fv[j]);
+                    if (!cst)
+                    {
+                        for (int s = 1; s < fSamples; s++)
+                        {
+                            AddFloatTrack(bindings, b, path, tt[s], fv[s * nf + j]);
+                        }
+                    }
+                }
+            }
+
+            return last;
         }
 
         private void CreateCurves()
@@ -92,6 +290,13 @@ namespace AnimeStudio
             Floats = m_floats.Keys.ToList();
             m_pptrs.AsEnumerable().ToList().ForEach(x => x.Key.curve.AddRange(x.Value));
             PPtrs = m_pptrs.Keys.ToList();
+
+            if (m_droppedPlaceholderFloats > 0)
+            {
+                Console.WriteLine("[Info] " + (animationClip.m_Name ?? "?") + ": 丢弃占位 float 曲线 "
+                    + m_droppedPlaceholderFloats + " 条（源数据 attribute 是序号，Unity 侧无对应属性；"
+                    + "设 ANIMESTUDIO_KEEP_PLACEHOLDER_FLOATS=1 可保留）");
+            }
         }
 
         private void ProcessStreams(List<StreamedClip.StreamedFrame> streamFrames, AnimationClipBindingConstant bindings, Dictionary<uint, string> tos, float sampleRate)
@@ -407,6 +612,28 @@ namespace AnimeStudio
             }
         }
 
+        /// <summary>
+        /// 单值轨道的统一入口：**按 customType 分派**，不要直接调 AddDefaultCurve。
+        /// - `None(0)`            → AddDefaultCurve（引擎属性，名字解析不出来时写占位名）
+        /// - `Transform(4)`       → AddTransformCurve（本方法不处理，调用方自己判）
+        /// - `AnimatorMuscle(8)`  → AddCustomCurve → AddAnimatorMuscleCurve（真实 muscle 名）
+        /// - 其它                  → AddCustomCurve
+        /// </summary>
+        private void AddFloatTrack(AnimationClipBindingConstant bindings, GenericBinding binding, string path, float time, float value)
+        {
+            if (binding.typeID == ClassIDType.Transform)
+            {
+                AddTransformCurve(time, binding.attribute, new[] { value }, new[] { 0f }, new[] { 0f }, 0, path);
+                return;
+            }
+            if ((BindingCustomType)binding.customType == BindingCustomType.None)
+            {
+                AddDefaultCurve(binding, path, time, value);
+                return;
+            }
+            AddCustomCurve(bindings, binding, path, time, value);
+        }
+
         private void AddDefaultCurve(GenericBinding binding, string path, float time, float value)
         {
             switch (binding.typeID)
@@ -439,7 +666,13 @@ namespace AnimeStudio
             }
             else
             {
-                // that means that dev exported animation clip with missing component
+                // 组件缺失 ⇒ 属性名解析不出来，占位名同样是垃圾
+                if (!KeepPlaceholderFloats)
+                {
+                    m_droppedPlaceholderFloats++;
+                    RegisterDroppedBinding(binding);
+                    return;
+                }
                 FloatCurve curve = new FloatCurve(path, MissedPropertyPrefix + binding.attribute, ClassIDType.GameObject, new PPtr<MonoScript>(0, 0, null));
                 AddFloatKeyframe(curve, time, value);
             }
@@ -447,20 +680,40 @@ namespace AnimeStudio
 
         private void AddScriptCurve(GenericBinding binding, string path, float time, float value)
         {
-#warning TODO:
+            // 同上：脚本属性名解析不出来时写 `script_<hash>` 也是占位垃圾（Unity 里显示成不存在的属性）
+            if (!KeepPlaceholderFloats)
+            {
+                m_droppedPlaceholderFloats++;
+                RegisterDroppedBinding(binding);
+                return;
+            }
             FloatCurve curve = new FloatCurve(path, ScriptPropertyPrefix + binding.attribute, ClassIDType.MonoBehaviour, binding.script.Cast<MonoScript>());
             AddFloatKeyframe(curve, time, value);
         }
 
         private void AddEngineCurve(GenericBinding binding, string path, float time, float value)
         {
-#warning TODO:
+            // 引擎组件的 float 轨道：attribute 无法解析成属性名（源里是序号）⇒ 占位名无意义，
+            // 默认丢弃。见 KeepPlaceholderFloats 的说明。
+            if (!KeepPlaceholderFloats)
+            {
+                m_droppedPlaceholderFloats++;
+                RegisterDroppedBinding(binding);
+                return;
+            }
             FloatCurve curve = new FloatCurve(path, TypeTreePropertyPrefix + binding.attribute, binding.typeID, new PPtr<MonoScript>(0, 0, null));
             AddFloatKeyframe(curve, time, value);
         }
 
         private void AddAnimatorMuscleCurve(GenericBinding binding, float time, float value)
         {
+            // ★ 属性名必须用 **Unity 真实序列化格式**（= AssetRipper 风格枚举名）：
+            //   实测 Unity 自产人形 clip（Starter Assets/FBX 导入）里写的是
+            //     LeftFootT.x / LeftFootQ.w / LeftHand.Index.1 Stretched / LeftFootTDOF.x / RootT.x
+            //   A/B 实测（batchmode 采样骨骼角度）：
+            //     `LeftHand.Index.1 Stretched` → 骨骼转 45° ✅ 生效
+            //     `Left Index 1 Stretched`（HumanTrait 显示名）→ 0° ❌ 无效
+            //   ⇒ 不要改成 HumanTrait.MuscleName 的显示名，也不要把这些槽位当"不可命名"丢弃。
             FloatCurve curve = new FloatCurve(string.Empty, binding.GetHumanoidMuscle().ToAttributeString(), ClassIDType.Animator, new PPtr<MonoScript>(0, 0, null));
             AddFloatKeyframe(curve, time, value);
         }

@@ -522,6 +522,7 @@ namespace AnimeStudio
         public BlendShapeData m_Shapes;
         public Matrix4x4[] m_BindPose;
         public uint[] m_BoneNameHashes;
+        public uint m_RootBoneNameHash;
         public int m_VertexCount;
         public float[] m_Vertices;
         public List<BoneWeights4> m_Skin;
@@ -587,7 +588,7 @@ namespace AnimeStudio
             {
                 m_BindPose = reader.ReadMatrixArray();
                 m_BoneNameHashes = reader.ReadUInt32Array();
-                var m_RootBoneNameHash = reader.ReadUInt32();
+                m_RootBoneNameHash = reader.ReadUInt32();
             }
 
             if (version[0] > 2 || (version[0] == 2 && version[1] >= 6)) //2.6.0 and up

@@ -46,9 +46,34 @@ namespace AnimeStudio
 
             yield break;
         }
+        /// <summary>
+        /// 全局 Avatar TOS（hash → 骨骼全路径）。
+        ///
+        /// 背景：导出是**逐文件**的（LoadFiles → 导出 → Clear），而 <see cref="FindTOS"/> 只在
+        /// 「当前已加载的文件」里找 Avatar/Animator。很多游戏的 Avatar 与 clip 不在同一个 bundle
+        /// （本项目实测 endfield：Avatar 在网格包，clip 在动画包）⇒ 局部 TOS 恒为空 ⇒
+        /// 所有曲线 path 退化成 <c>path_&lt;hash&gt;</c>，Unity 里根本绑不上骨骼。
+        ///
+        /// 修法：CLI 在导出前先跑一遍预扫，把所有 Avatar 的 <c>m_TOS</c> 汇总到这里，
+        /// <see cref="FindTOS"/> 再把它并进去。
+        /// </summary>
+        public static readonly Dictionary<uint, string> GlobalTOS = new Dictionary<uint, string>();
+
+        public static void AddGlobalTOS(Avatar avatar)
+        {
+            if (avatar?.m_TOS == null)
+            {
+                return;
+            }
+            foreach (var kv in avatar.m_TOS)
+            {
+                GlobalTOS[kv.Key] = kv.Value;
+            }
+        }
+
         public static Dictionary<uint, string> FindTOS(this AnimationClip clip)
         {
-            var tos = new Dictionary<uint, string>() { { 0, string.Empty } };
+            var tos = new Dictionary<uint, string>(GlobalTOS) { [0] = string.Empty };
             foreach (var asset in clip.assetsFile.assetsManager.assetsFileList.SelectMany(x => x.Objects).OrderBy(x => x.type).ToArray())
             {
                 switch (asset.type)

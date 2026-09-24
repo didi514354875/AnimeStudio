@@ -1,4 +1,5 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 
 namespace AnimeStudio
 {
@@ -392,6 +393,16 @@ namespace AnimeStudio
     {
         public uint m_AvatarSize;
         public AvatarConstant m_Avatar;
+
+        /// <summary>
+        /// m_Avatar（AvatarConstant）的**原始字节**。Unity 在 YAML 里把这段作为
+        /// `m_Avatar` 的十六进制 blob 存下来，所以还原时必须逐字节写回 —— 自己重序列化
+        /// 极易出错（字段顺序/对齐/字符串长度前缀）。这里在读取时把位置前后一切片留档。
+        /// </summary>
+        public byte[] m_AvatarRaw;
+
+        /// <summary>AvatarConstant 的读取器实际消耗字节数（与 m_AvatarSize 可能不一致）。</summary>
+        public int m_AvatarConsumed;
         public Dictionary<uint, string> m_TOS;
 
         public HumanDescription m_HumanDescription;
@@ -404,7 +415,39 @@ namespace AnimeStudio
             IsZZZ = reader.Game.Type.IsZZZ();
 
             m_AvatarSize = reader.ReadUInt32();
+            long __blobStart = reader.Position;
             m_Avatar = new AvatarConstant(reader, IsZZZ);
+            long __blobEnd = reader.Position;
+            m_AvatarConsumed = (int)(__blobEnd - __blobStart);
+
+            // ★ 以 **m_AvatarSize** 为准切片：实测源里 m_AvatarSize=55652 而 AvatarConstant
+            //   只「读掉」47640 字节 —— 差的 8012 字节里可能放着 blob 内部偏移指向的数据，
+            //   少了它 Unity 会 isValid=true 但 **isHuman=false**（人力映射建不起来）。
+            //   切完把读指针也推到 m_AvatarSize 之后，后续 TOS 才对得上。
+            //   ★ 2026-09-23 实测修正（外部证据：CLI 的 JSON 导出，非本 reader 自证）：
+            //   JSON 导出里 `m_AvatarSize = 55652`（对象原字段），而本 reader 顺序读只消费 47640；
+            //   **但紧随其后的 `numTOS` 读到 441 且 441 条路径全部正确解出**
+            //   ⇒ 顺序读的位置是**对的**，AvatarConstant 就是 47640 字节。
+            //   ⇒ `m_AvatarSize` 与「顺序读消耗」不是一个口径；不能拿它当切片的硬依据。
+            //   `HGR_AVATAR_PROBE=1` 时**只多切**那 8012 字节（读指针仍回 __blobEnd，保证 TOS 不受影响），
+            //   用来离线分析尾部到底是什么（这是唯一能拿到那段原始字节的通道）。
+            int __declared = (int)m_AvatarSize;
+            bool __probe = Environment.GetEnvironmentVariable("HGR_AVATAR_PROBE") == "1";
+            bool __slice = Environment.GetEnvironmentVariable("HGR_AVATAR_SIZE_SLICE") == "1";
+            if (__blobStart + __declared <= reader.Length && (__declared > 0)
+                && (__probe || __slice))
+            {
+                reader.Position = __blobStart;
+                m_AvatarRaw = reader.ReadBytes(__declared);
+                // probe 模式：后续仍从 __blobEnd 续读（TOS 正确）；slice 模式：按声明值推进（历史行为）
+                reader.Position = __probe ? __blobEnd : (__blobStart + __declared);
+            }
+            else
+            {
+                reader.Position = __blobStart;
+                m_AvatarRaw = reader.ReadBytes((int)(__blobEnd - __blobStart));
+                reader.Position = __blobEnd;
+            }
 
             // this is what was messing zzz up
             // tested with multiple games, both hoyo and base unity and this align doesnt mess anything up....

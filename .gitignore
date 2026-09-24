@@ -339,3 +339,7 @@ ASALocalRun/
 
 # BeatPulse healthcheck temp database
 healthchecksdb
+
+# Editor backup files
+*.bak_*
+*.bak[0-9]*
